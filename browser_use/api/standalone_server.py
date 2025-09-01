@@ -13,6 +13,8 @@ import logging
 import os
 import sys
 import time
+import secrets
+import string
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from contextlib import asynccontextmanager
@@ -105,6 +107,16 @@ class MCPRequest(BaseModel):
     tool_name: str = Field(..., description="Name of the tool to execute")
     parameters: Dict[str, Any] = Field(..., description="Parameters for the tool")
 
+class PasswordGenerationRequest(BaseModel):
+    website: str = Field(..., description="Website/domain for which to generate credentials")
+    email: str = Field(..., description="Email address to use for the account")
+    session_id: str = Field("default", description="Browser session ID")
+
+class AccountRetrievalRequest(BaseModel):
+    website: str = Field(..., description="Website/domain for which to retrieve credentials")
+    email: str = Field(..., description="Email address to retrieve credentials for")
+    session_id: str = Field("default", description="Browser session ID")
+
 class CreateSessionRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Custom session ID")
     headless: bool = Field(True, description="Whether to run browser in headless mode")
@@ -121,6 +133,11 @@ class SessionResponse(BaseModel):
     session_id: str
     status: str
     message: str
+
+class SelectDropdownRequest(BaseModel):
+    session_id: str
+    index: int
+    text: str
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -142,6 +159,8 @@ class ServerState:
         self.agents: Dict[str, Agent] = {}
         self.controllers: Dict[str, Controller] = {}
         self.file_systems: Dict[str, FileSystem] = {}
+        # Account storage: {session_id: {website: {email: {"email": str, "password": str}}}}
+        self.account_storage: Dict[str, Dict[str, Dict[str, Dict[str, str]]]] = {}
 
     async def cleanup(self):
         """Clean up all active sessions"""
@@ -163,6 +182,55 @@ class ServerState:
             except Exception as e:
                 logger.error(f"Error closing browser session {session_id}: {e}")
 
+    def generate_password(self, length: int = 16) -> str:
+        """Generate a secure random password"""
+        alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+        password = ''.join(secrets.choice(alphabet) for i in range(length))
+        return password
+
+    def store_account(self, session_id: str, website: str, email: str, password: str):
+        """Store account credentials for a session and website"""
+        if session_id not in self.account_storage:
+            self.account_storage[session_id] = {}
+        
+        if website not in self.account_storage[session_id]:
+            self.account_storage[session_id][website] = {}
+        
+        self.account_storage[session_id][website][email] = {
+            "email": email,
+            "password": password
+        }
+        
+        # Also save to file for persistence
+        self._save_accounts_to_file()
+
+    def get_account(self, session_id: str, website: str, email: str) -> Optional[Dict[str, str]]:
+        """Retrieve account credentials for a session, website, and email"""
+        return self.account_storage.get(session_id, {}).get(website, {}).get(email)
+
+    def _save_accounts_to_file(self):
+        """Save accounts to a JSON file for persistence"""
+        try:
+            accounts_file = Path.home() / '.browser-use-api' / 'accounts.json'
+            accounts_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(accounts_file, 'w') as f:
+                json.dump(self.account_storage, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving accounts to file: {e}")
+
+    def _load_accounts_from_file(self):
+        """Load accounts from JSON file"""
+        try:
+            accounts_file = Path.home() / '.browser-use-api' / 'accounts.json'
+            if accounts_file.exists():
+                with open(accounts_file, 'r') as f:
+                    self.account_storage = json.load(f)
+                logger.info("Loaded existing account storage from file")
+        except Exception as e:
+            logger.error(f"Error loading accounts from file: {e}")
+            self.account_storage = {}
+
 # Global server state
 server_state = ServerState()
 
@@ -171,6 +239,7 @@ async def lifespan(app: FastAPI):
     """Handle server startup and shutdown"""
     # Startup
     logger.info("Starting standalone browser-use API server")
+    server_state._load_accounts_from_file()
     yield
     # Shutdown
     await server_state.cleanup()
@@ -423,6 +492,19 @@ def create_app() -> FastAPI:
                     raise HTTPException(status_code=400, detail="task_id parameter required")
                 return await get_agent_task_status(task_id)
             
+            elif tool_name == "select_dropdown_option":
+                select_req = SelectDropdownRequest(**parameters)
+                return await select_dropdown_option(select_req)
+
+            # Account management tools
+            elif tool_name == "generate_account_credentials":
+                cred_req = PasswordGenerationRequest(**parameters)
+                return await generate_account_credentials(cred_req)
+            
+            elif tool_name == "retrieve_account_credentials":
+                retrieve_req = AccountRetrievalRequest(**parameters)
+                return await retrieve_account_credentials(retrieve_req)
+            
             else:
                 raise HTTPException(status_code=400, detail=f"Unknown tool: {tool_name}")
                 
@@ -463,7 +545,10 @@ def create_app() -> FastAPI:
                 # Agent tasks
                 "run_agent_task",
                 "retry_with_browser_use_agent",
-                "get_agent_task_status"
+                "get_agent_task_status",
+                # Account management
+                "generate_account_credentials",
+                "retrieve_account_credentials"
             ],
             "schema": {
                 "tool_name": "string (required)",
@@ -541,6 +626,178 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.error(f"Error pressing key: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/browser/select")
+    async def select_dropdown_option(
+        request: SelectDropdownRequest
+        # index: int,
+        # text: str
+    ):
+        browser_session = await get_session(request.session_id)
+        index = request.index
+        text = request.text
+
+        """Select dropdown option or ARIA menu item by the text of the option you want to select"""
+        page = await browser_session.get_current_page()
+        dom_element = await browser_session.get_dom_element_by_index(index)
+        if dom_element is None:
+            raise Exception(f'Element index {index} does not exist - retry or use alternative actions')
+
+        logger.debug(f"Attempting to select '{text}' using xpath: {dom_element.xpath}")
+        logger.debug(f'Element attributes: {dom_element.attributes}')
+        logger.debug(f'Element tag: {dom_element.tag_name}')
+
+        xpath = '//' + dom_element.xpath
+
+        try:
+            frame_index = 0
+            for frame in page.frames:
+                try:
+                    logger.debug(f'Trying frame {frame_index} URL: {frame.url}')
+
+                    # First check what type of element we're dealing with
+                    element_info_js = """
+                        (xpath) => {
+                            try {
+                                const element = document.evaluate(xpath, document, null,
+                                    XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                                if (!element) return null;
+                                
+                                const tagName = element.tagName.toLowerCase();
+                                const role = element.getAttribute('role');
+                                
+                                // Check if it's a native select
+                                if (tagName === 'select') {
+                                    return {
+                                        type: 'select',
+                                        found: true,
+                                        id: element.id,
+                                        name: element.name,
+                                        tagName: element.tagName,
+                                        optionCount: element.options.length,
+                                        currentValue: element.value,
+                                        availableOptions: Array.from(element.options).map(o => o.text.trim())
+                                    };
+                                }
+                                
+                                // Check if it's an ARIA menu or similar
+                                if (role === 'menu' || role === 'listbox' || role === 'combobox') {
+                                    const menuItems = element.querySelectorAll('[role="menuitem"], [role="option"]');
+                                    return {
+                                        type: 'aria',
+                                        found: true,
+                                        id: element.id || '',
+                                        role: role,
+                                        tagName: element.tagName,
+                                        itemCount: menuItems.length,
+                                        availableOptions: Array.from(menuItems).map(item => item.textContent.trim())
+                                    };
+                                }
+                                
+                                return {
+                                    error: `Element is neither a select nor an ARIA menu (tag: ${tagName}, role: ${role})`,
+                                    found: false
+                                };
+                            } catch (e) {
+                                return {error: e.toString(), found: false};
+                            }
+                        }
+                    """
+
+                    element_info = await frame.evaluate(element_info_js, dom_element.xpath)
+
+                    if element_info and element_info.get('found'):
+                        logger.debug(f'Found {element_info.get("type")} element in frame {frame_index}: {element_info}')
+
+                        if element_info.get('type') == 'select':
+                            # Handle native select element
+                            # "label" because we are selecting by text
+                            # nth(0) to disable error thrown by strict mode
+                            # timeout=1000 because we are already waiting for all network events
+                            selected_option_values = (
+                                await frame.locator('//' + dom_element.xpath).nth(0).select_option(label=text, timeout=1000)
+                            )
+
+                            msg = f'selected option {text} with value {selected_option_values}'
+                            logger.info(msg + f' in frame {frame_index}')
+
+                            return {'message': msg}
+
+                        elif element_info.get('type') == 'aria':
+                            # Handle ARIA menu
+                            click_aria_item_js = """
+                                (params) => {
+                                    const { xpath, targetText } = params;
+                                    try {
+                                        const element = document.evaluate(xpath, document, null,
+                                            XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                                        if (!element) return {success: false, error: 'Element not found'};
+                                        
+                                        // Find all menu items
+                                        const menuItems = element.querySelectorAll('[role="menuitem"], [role="option"]');
+                                        
+                                        for (const item of menuItems) {
+                                            const itemText = item.textContent.trim();
+                                            if (itemText === targetText) {
+                                                // Simulate click on the menu item
+                                                item.click();
+                                                
+                                                // Also try dispatching a click event in case the click handler needs it
+                                                const clickEvent = new MouseEvent('click', {
+                                                    view: window,
+                                                    bubbles: true,
+                                                    cancelable: true
+                                                });
+                                                item.dispatchEvent(clickEvent);
+                                                
+                                                return {
+                                                    success: true,
+                                                    message: `Clicked menu item: ${targetText}`
+                                                };
+                                            }
+                                        }
+                                        
+                                        return {
+                                            success: false,
+                                            error: `Menu item with text '${targetText}' not found`
+                                        };
+                                    } catch (e) {
+                                        return {success: false, error: e.toString()};
+                                    }
+                                }
+                            """
+
+                            result = await frame.evaluate(
+                                click_aria_item_js, {'xpath': dom_element.xpath, 'targetText': text}
+                            )
+
+                            if result.get('success'):
+                                msg = result.get('message', f'Selected ARIA menu item: {text}')
+                                logger.info(msg + f' in frame {frame_index}')
+                                return {'message': msg}
+                            else:
+                                logger.error(f'Failed to select ARIA menu item: {result.get("error")}')
+                                continue
+
+                    elif element_info:
+                        logger.error(f'Frame {frame_index} error: {element_info.get("error")}')
+                        continue
+
+                except Exception as frame_e:
+                    logger.error(f'Frame {frame_index} attempt failed: {str(frame_e)}')
+                    logger.error(f'Frame type: {type(frame)}')
+                    logger.error(f'Frame URL: {frame.url}')
+
+                frame_index += 1
+
+            msg = f"Could not select option '{text}' in any frame"
+            logger.info(msg)
+            return {'message': msg}
+
+        except Exception as e:
+            msg = f'Selection failed: {str(e)}'
+            logger.error(msg)
+            return {'message': msg}
 
     @app.post("/browser/scroll")
     async def browser_scroll(request: BrowserScrollRequest):
@@ -888,6 +1145,69 @@ def create_app() -> FastAPI:
             "status": "running" if is_running else "completed",
             **history_info
         }
+
+    # Account management endpoints
+    @app.post("/account/generate")
+    async def generate_account_credentials(request: PasswordGenerationRequest):
+        """Generate account credentials for a website"""
+        try:
+            # Normalize website URL
+            website = request.website.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
+            
+            # Use provided email and generate password
+            email = request.email
+            password = server_state.generate_password()
+            
+            # Store credentials
+            server_state.store_account(request.session_id, website, email, password)
+            
+            logger.info(f"Generated credentials for {website} in session {request.session_id}")
+            
+            return {
+                "website": website,
+                "email": email,
+                "password": password,
+                "session_id": request.session_id,
+                "message": f"Generated and stored credentials for {website}"
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating credentials: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/account/retrieve")
+    async def retrieve_account_credentials(request: AccountRetrievalRequest):
+        """Retrieve stored account credentials for a website"""
+        try:
+            # Normalize website URL
+            website = request.website.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
+            
+            # Retrieve credentials
+            credentials = server_state.get_account(request.session_id, website, request.email)
+            
+            if not credentials:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"No credentials found for {request.email} on {website} in session {request.session_id}"
+                )
+            
+            logger.info(f"Retrieved credentials for {request.email} on {website} in session {request.session_id}")
+            
+            ret_info = {
+                "website": website,
+                "email": credentials["email"],
+                "password": credentials["password"],
+                "session_id": request.session_id,
+                "message": f"Retrieved credentials for {request.email} on {website}"
+            }
+            print(f"Retrieved credentials: {ret_info}")
+            return ret_info
+
+        except Exception as e:
+            logger.error(f"Error retrieving credentials: {e}")
+            if isinstance(e, HTTPException):
+                raise e
+            raise HTTPException(status_code=500, detail=str(e))
 
     return app
 
