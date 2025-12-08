@@ -567,7 +567,7 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 		description="Enable automation-optimized extensions: ad blocking (uBlock Origin), cookie handling (I still don't care about cookies), and URL cleaning (ClearURLs). All extensions work automatically without manual intervention. Extensions are automatically downloaded and loaded when enabled.",
 	)
 	window_size: ViewportSize | None = Field(
-		default=None,
+		default=ViewportSize(width=600, height=850),
 		description='Browser window size to use when headless=False.',
 	)
 	window_height: int | None = Field(default=None, description='DEPRECATED, use window_size["height"] instead', exclude=True)

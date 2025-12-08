@@ -73,6 +73,11 @@ class BrowserScrollRequest(BaseModel):
     direction: str = Field("down", description="Direction to scroll ('up' or 'down')")
     session_id: str = Field("default", description="Browser session ID")
 
+class FileUploadRequest(BaseModel):
+    file_path: str = Field(..., description="Path to the file to upload")
+    session_id: str = Field("default", description="Browser session ID")
+    index: int = Field(..., description="The index of the file upload element")
+
 class BrowserExtractContentRequest(BaseModel):
     query: str = Field(..., description="What information to extract from the page")
     extract_links: bool = Field(False, description="Whether to include links in the extraction")
@@ -134,6 +139,10 @@ class SessionResponse(BaseModel):
     status: str
     message: str
 
+class FileUploadResponse(BaseModel):
+    session_id: str
+    message: str
+
 class SelectDropdownRequest(BaseModel):
     session_id: str
     index: int
@@ -151,6 +160,7 @@ class BrowserStateResponse(BaseModel):
     tabs: List[Dict[str, str]]
     interactive_elements: List[Dict[str, Any]]
     screenshot: Optional[str] = None
+    message: Optional[str] = None
 
 # Global state management
 class ServerState:
@@ -160,7 +170,7 @@ class ServerState:
         self.controllers: Dict[str, Controller] = {}
         self.file_systems: Dict[str, FileSystem] = {}
         # Account storage: {session_id: {website: {email: {"email": str, "password": str}}}}
-        self.account_storage: Dict[str, Dict[str, Dict[str, Dict[str, str]]]] = {}
+        self.account_storage: Dict[str, List[Dict[str, str]]] = {}
 
     async def cleanup(self):
         """Clean up all active sessions"""
@@ -184,29 +194,26 @@ class ServerState:
 
     def generate_password(self, length: int = 16) -> str:
         """Generate a secure random password"""
-        alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-        password = ''.join(secrets.choice(alphabet) for i in range(length))
+        # alphabet = string.ascii_letters + string.digits + "1!@#$%^&*Aa"
+        # password = ''.join(secrets.choice(alphabet) for i in range(length))
+        password = 'DontCallAlpha114514!'
         return password
 
     def store_account(self, session_id: str, website: str, email: str, password: str):
         """Store account credentials for a session and website"""
         if session_id not in self.account_storage:
-            self.account_storage[session_id] = {}
+            self.account_storage[session_id] = []
         
-        if website not in self.account_storage[session_id]:
-            self.account_storage[session_id][website] = {}
-        
-        self.account_storage[session_id][website][email] = {
-            "email": email,
-            "password": password
-        }
-        
+        self.account_storage[session_id].append(
+            {"website": website, "email": email, "password": password}
+        )
+
         # Also save to file for persistence
         self._save_accounts_to_file()
 
-    def get_account(self, session_id: str, website: str, email: str) -> Optional[Dict[str, str]]:
+    def get_account(self, session_id: str):
         """Retrieve account credentials for a session, website, and email"""
-        return self.account_storage.get(session_id, {}).get(website, {}).get(email)
+        return self.account_storage.get(session_id, [])
 
     def _save_accounts_to_file(self):
         """Save accounts to a JSON file for persistence"""
@@ -261,6 +268,13 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    
+    app.state.latest_state = None
+
+    def update_latest_state(interactive_elements: list):
+        app.state.latest_state = {
+            x['index']: x['text'] for x in interactive_elements
+        }
 
     @app.get("/")
     async def root():
@@ -303,7 +317,7 @@ def create_app() -> FastAPI:
                 # Create default session with sensible defaults
                 default_request = CreateSessionRequest(
                     session_id="default",
-                    headless=True,
+                    headless=False,
                     allowed_domains=[],
                     wait_between_actions=0.5
                 )
@@ -326,9 +340,10 @@ def create_app() -> FastAPI:
             profile = BrowserProfile(
                 downloads_path=str(Path.home() / 'Downloads' / 'browser-use-api'),
                 wait_between_actions=request.wait_between_actions,
-                keep_alive=True,
+                keep_alive=False,
                 user_data_dir='~/.config/browseruse/profiles/api',
-                headless=request.headless,
+                # headless=request.headless,
+                headless=False,
                 allowed_domains=request.allowed_domains,
             )
             
@@ -430,23 +445,23 @@ def create_app() -> FastAPI:
                 return await close_session(close_req)
             
             # Browser navigation tools
-            elif tool_name == "browser_navigate":
+            elif tool_name == "navigate":
                 nav_req = BrowserNavigateRequest(**parameters)
                 return await browser_navigate(nav_req)
             
-            elif tool_name == "browser_click":
+            elif tool_name == "click":
                 click_req = BrowserClickRequest(**parameters)
                 return await browser_click(click_req)
             
-            elif tool_name == "browser_type":
+            elif tool_name == "type":
                 type_req = BrowserTypeRequest(**parameters)
                 return await browser_type(type_req)
             
-            elif tool_name == "browser_key":
+            elif tool_name == "key":
                 key_req = BrowserKeyRequest(**parameters)
                 return await browser_key(key_req)
             
-            elif tool_name == "browser_scroll":
+            elif tool_name == "scroll":
                 scroll_req = BrowserScrollRequest(**parameters)
                 return await browser_scroll(scroll_req)
             
@@ -455,27 +470,31 @@ def create_app() -> FastAPI:
                 return await get_browser_state(state_req)
             
             # Content extraction tool
-            elif tool_name == "browser_extract_content":
+            elif tool_name == "extract_content":
                 extract_req = BrowserExtractContentRequest(**parameters)
                 return await browser_extract_content(extract_req)
             
             # Browser navigation tools
-            elif tool_name == "browser_go_back":
+            elif tool_name == "go_back":
                 back_req = BrowserGoBackRequest(**parameters)
                 return await browser_go_back(back_req)
             
             # Tab management tools
-            elif tool_name == "browser_list_tabs":
+            elif tool_name == "list_tabs":
                 list_tabs_req = BrowserListTabsRequest(**parameters)
                 return await browser_list_tabs(list_tabs_req)
-            
-            elif tool_name == "browser_switch_tab":
+
+            elif tool_name == "switch_tab":
                 switch_req = BrowserSwitchTabRequest(**parameters)
                 return await browser_switch_tab(switch_req)
             
-            elif tool_name == "browser_close_tab":
+            elif tool_name == "close_tab":
                 close_tab_req = BrowserCloseTabRequest(**parameters)
                 return await browser_close_tab(close_tab_req)
+            
+            elif tool_name == "upload_file":
+                upload_req = FileUploadRequest(**parameters)
+                return await browser_upload_file(upload_req)
             
             # Agent tools
             elif tool_name == "browse_agent":
@@ -588,7 +607,50 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail=f'Element with index {request.index} not found')
 
             await session._click_element_node(element)
-            return {"message": f'Clicked element {request.index}'}
+            
+            time.sleep(2)
+            state = await session.get_browser_state_with_recovery(cache_clickable_elements_hashes=False)
+
+            interactive_elements = []
+            for index, element in state.selector_map.items():
+                elem_info = {
+                    'index': index,
+                    'tag': element.tag_name,
+                    'text': element.get_all_text_till_next_clickable_element(max_depth=2)[:100],
+                }
+                if element.attributes.get('placeholder'):
+                    elem_info['placeholder'] = element.attributes['placeholder']
+                if element.attributes.get('href'):
+                    elem_info['href'] = element.attributes['href']
+                if elem_info['tag'] != 'div' and elem_info['text'] != '':
+                    interactive_elements.append(elem_info)
+                interactive_elements = sorted(interactive_elements, key=lambda x: x['index'])
+
+            response_data = {
+                'url': state.url,
+                'title': state.title,
+                'tabs': [{'url': tab.url, 'title': tab.title} for tab in state.tabs],
+                'interactive_elements': interactive_elements,
+                'message': f'Clicked on element {app.state.latest_state[request.index]}.'
+            }
+            
+            if interactive_elements[-1]['tag'] == 'tr':
+                response_data['message'] += ' The table is incomplete. Now you need to scroll down to load more rows.'
+            
+            update_latest_state(interactive_elements)
+            
+            # page = await session.get_current_page()
+            # xpath = element.xpath
+            # await page.evaluate(
+            #     """(xpath) => {
+            #         const node = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            #         if (node) node.scrollIntoView({behavior: 'smooth', block: 'center'});
+            #     }""",
+            #     xpath
+            # )
+
+            response_data['screenshot'] = state.screenshot
+            return BrowserStateResponse(**response_data)
 
         except Exception as e:
             logger.error(f"Error clicking element: {e}")
@@ -605,6 +667,36 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail=f'Element with index {request.index} not found')
 
             await session._input_text_element_node(element, request.text)
+            
+            time.sleep(2)
+            page = await session.get_current_page()
+
+            state = await session.get_browser_state_with_recovery(cache_clickable_elements_hashes=False)
+
+            interactive_elements = []
+            for index, element in state.selector_map.items():
+                elem_info = {
+                    'index': index,
+                    'tag': element.tag_name,
+                    'text': element.get_all_text_till_next_clickable_element(max_depth=2)[:100],
+                }
+                if element.attributes.get('placeholder'):
+                    elem_info['placeholder'] = element.attributes['placeholder']
+                if element.attributes.get('href'):
+                    elem_info['href'] = element.attributes['href']
+                interactive_elements.append(elem_info)
+
+            response_data = {
+                'url': state.url,
+                'title': state.title,
+                'tabs': [{'url': tab.url, 'title': tab.title} for tab in state.tabs],
+                'interactive_elements': interactive_elements,
+                'message': f'Typed {request.text} on element {request.index}.'
+            }
+            update_latest_state(interactive_elements)
+
+            response_data['screenshot'] = state.screenshot
+            return BrowserStateResponse(**response_data)
             return {"message": f"Typed '{request.text}' into element {request.index}"}
 
         except Exception as e:
@@ -619,13 +711,73 @@ def create_app() -> FastAPI:
             page = await session.get_current_page()
             
             # Press the specified key
-            await page.keyboard.press(request.key)
+            if len(request.key) == 1 or request.key in ['Enter', 'Escape', 'Tab', 'Space', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']:
+                await page.keyboard.press(request.key)
+            else:
+                for char in request.key:
+                    await page.keyboard.press(char)
             
-            return {"message": f"Pressed key: {request.key}"}
+            time.sleep(2)
+            state = await session.get_browser_state_with_recovery(cache_clickable_elements_hashes=False)
+
+            interactive_elements = []
+            for index, element in state.selector_map.items():
+                elem_info = {
+                    'index': index,
+                    'tag': element.tag_name,
+                    'text': element.get_all_text_till_next_clickable_element(max_depth=2)[:100],
+                }
+                if element.attributes.get('placeholder'):
+                    elem_info['placeholder'] = element.attributes['placeholder']
+                if element.attributes.get('href'):
+                    elem_info['href'] = element.attributes['href']
+                interactive_elements.append(elem_info)
+
+            response_data = {
+                'url': state.url,
+                'title': state.title,
+                'tabs': [{'url': tab.url, 'title': tab.title} for tab in state.tabs],
+                'interactive_elements': interactive_elements,
+            }
+
+            response_data['screenshot'] = state.screenshot
+            return BrowserStateResponse(**response_data)
+            
+            # return {"message": f"Pressed key: {request.key}"}
 
         except Exception as e:
             logger.error(f"Error pressing key: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+    
+    
+    @app.post("/browser/upload_file")
+    async def browser_upload_file(request: FileUploadRequest):
+        """Upload a file to a file input element"""
+        session = await get_session(request.session_id)
+        
+        file_upload_dom_el = await session.find_file_upload_element_by_index(
+            request.index, max_height=3, max_descendant_depth=3
+        )
+        file_upload_el = await session.get_locate_element(file_upload_dom_el)
+        
+        if file_upload_el is None:
+            msg = f'No file upload element found at index {request.index}'
+            logger.info(msg)
+            raise HTTPException(status_code=500, detail=msg)
+
+        try:
+            await file_upload_el.set_input_files(request.file_path)
+            msg = f'📁 Successfully uploaded file to index {request.index}'
+            logger.info(msg)
+            return FileUploadResponse(
+                session_id=request.session_id,
+                message=msg,
+            )
+        except Exception as e:
+            msg = f'Failed to upload file to index {request.index}: {str(e)}'
+            logger.info(msg)
+            raise HTTPException(status_code=500, detail=msg)
+    
     
     @app.post("/browser/select")
     async def select_dropdown_option(
@@ -720,6 +872,35 @@ def create_app() -> FastAPI:
 
                             msg = f'selected option {text} with value {selected_option_values}'
                             logger.info(msg + f' in frame {frame_index}')
+                            
+                            page = await browser_session.get_current_page()
+
+                            state = await browser_session.get_browser_state_with_recovery(cache_clickable_elements_hashes=False)
+
+                            interactive_elements = []
+                            for index, element in state.selector_map.items():
+                                elem_info = {
+                                    'index': index,
+                                    'tag': element.tag_name,
+                                    'text': element.get_all_text_till_next_clickable_element(max_depth=2)[:100],
+                                }
+                                if element.attributes.get('placeholder'):
+                                    elem_info['placeholder'] = element.attributes['placeholder']
+                                if element.attributes.get('href'):
+                                    elem_info['href'] = element.attributes['href']
+                                interactive_elements.append(elem_info)
+
+                            response_data = {
+                                'url': state.url,
+                                'title': state.title,
+                                'tabs': [{'url': tab.url, 'title': tab.title} for tab in state.tabs],
+                                'interactive_elements': interactive_elements,
+                                'message': msg
+                            }
+                            update_latest_state(interactive_elements)
+
+                            response_data['screenshot'] = state.screenshot
+                            return BrowserStateResponse(**response_data)
 
                             return {'message': msg}
 
@@ -811,7 +992,7 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=400, detail="Direction must be 'up' or 'down'")
             
             # Get viewport height for scrolling
-            viewport_height = await page.evaluate('() => window.innerHeight')
+            viewport_height = await page.evaluate('() => window.innerHeight') - 150
             
             # Calculate scroll distance (positive for down, negative for up)
             scroll_distance = viewport_height if request.direction == "down" else -viewport_height
@@ -819,7 +1000,32 @@ def create_app() -> FastAPI:
             # Perform the scroll
             await page.evaluate('(distance) => window.scrollBy(0, distance)', scroll_distance)
             
-            return {"message": f"Scrolled {request.direction} by {abs(scroll_distance)} pixels"}
+            time.sleep(2)
+            state = await session.get_browser_state_with_recovery(cache_clickable_elements_hashes=False)
+
+            interactive_elements = []
+            for index, element in state.selector_map.items():
+                elem_info = {
+                    'index': index,
+                    'tag': element.tag_name,
+                    'text': element.get_all_text_till_next_clickable_element(max_depth=2)[:100],
+                }
+                if element.attributes.get('placeholder'):
+                    elem_info['placeholder'] = element.attributes['placeholder']
+                if element.attributes.get('href'):
+                    elem_info['href'] = element.attributes['href']
+                interactive_elements.append(elem_info)
+
+            response_data = {
+                'url': state.url,
+                'title': state.title,
+                'tabs': [{'url': tab.url, 'title': tab.title} for tab in state.tabs],
+                'interactive_elements': interactive_elements,
+            }
+
+            response_data['screenshot'] = state.screenshot
+            return BrowserStateResponse(**response_data)
+            # return {"message": f"Scrolled {request.direction} by {abs(scroll_distance)} pixels"}
 
         except Exception as e:
             logger.error(f"Error scrolling: {e}")
@@ -845,7 +1051,7 @@ def create_app() -> FastAPI:
 
             # Create LLM for extraction
             llm = ChatOpenAI(
-                model="gpt-4o-mini",  # Using mini for content extraction to reduce costs
+                model="gpt-4.1",  # Using mini for content extraction to reduce costs
                 api_key=api_key,
                 temperature=0.7,
             )
@@ -974,7 +1180,7 @@ def create_app() -> FastAPI:
             profile = BrowserProfile(
                 downloads_path=str(Path.home() / 'Downloads' / 'browser-use-api'),
                 wait_between_actions=0.5,
-                keep_alive=True,
+                keep_alive=False,
                 user_data_dir='~/.config/browseruse/profiles/api-agent',
                 headless=True,
                 allowed_domains=request.allowed_domains,
@@ -1036,6 +1242,8 @@ def create_app() -> FastAPI:
                     'tag': element.tag_name,
                     'text': element.get_all_text_till_next_clickable_element(max_depth=2)[:100],
                 }
+                if elem_info['text'] == '':
+                    elem_info['text'] = '(No text)'
                 if element.attributes.get('placeholder'):
                     elem_info['placeholder'] = element.attributes['placeholder']
                 if element.attributes.get('href'):
@@ -1048,6 +1256,7 @@ def create_app() -> FastAPI:
                 'tabs': [{'url': tab.url, 'title': tab.title} for tab in state.tabs],
                 'interactive_elements': interactive_elements,
             }
+            update_latest_state(interactive_elements)
 
             if request.include_screenshot and state.screenshot:
                 response_data['screenshot'] = state.screenshot
@@ -1183,7 +1392,7 @@ def create_app() -> FastAPI:
             website = request.website.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
             
             # Retrieve credentials
-            credentials = server_state.get_account(request.session_id, website, request.email)
+            credentials = server_state.get_account(request.session_id)
             
             if not credentials:
                 raise HTTPException(
@@ -1194,11 +1403,8 @@ def create_app() -> FastAPI:
             logger.info(f"Retrieved credentials for {request.email} on {website} in session {request.session_id}")
             
             ret_info = {
-                "website": website,
-                "email": credentials["email"],
-                "password": credentials["password"],
+                "credentials": credentials,
                 "session_id": request.session_id,
-                "message": f"Retrieved credentials for {request.email} on {website}"
             }
             print(f"Retrieved credentials: {ret_info}")
             return ret_info

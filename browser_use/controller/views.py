@@ -59,6 +59,12 @@ class UploadFileAction(BaseModel):
 	path: str
 
 
+# class FileUploadRequest(BaseModel):
+#     file_path: str = Field(..., description="Path to the file to upload")
+#     session_id: str = Field("default", description="Browser session ID")
+#     index: int = Field(..., description="The index of the file upload element")
+
+
 class ExtractPageContentAction(BaseModel):
 	value: str
 
