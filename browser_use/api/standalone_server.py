@@ -108,9 +108,12 @@ class RetryWithAgentRequest(BaseModel):
 class CloseSessionRequest(BaseModel):
     session_id: str = Field(..., description="Browser session ID to close")
 
+class CheckSubmissionStatusRequest(BaseModel):
+    session_id: str = Field(..., description="Browser session ID to check")
+
 class MCPRequest(BaseModel):
     tool_name: str = Field(..., description="Name of the tool to execute")
-    parameters: Dict[str, Any] = Field(..., description="Parameters for the tool")
+    parameters: Union[Dict[str, Any], str] = Field(..., description="Parameters for the tool")
 
 class PasswordGenerationRequest(BaseModel):
     website: str = Field(..., description="Website/domain for which to generate credentials")
@@ -171,6 +174,8 @@ class ServerState:
         self.file_systems: Dict[str, FileSystem] = {}
         # Account storage: {session_id: {website: {email: {"email": str, "password": str}}}}
         self.account_storage: Dict[str, List[Dict[str, str]]] = {}
+        # Form submission status: {session_id: bool} - tracks if browser session was properly closed
+        self.form_submission_status: Dict[str, bool] = {}
 
     async def cleanup(self):
         """Clean up all active sessions"""
@@ -330,19 +335,26 @@ def create_app() -> FastAPI:
     @app.post("/sessions", response_model=SessionResponse)
     async def create_session(request: CreateSessionRequest):
         """Create a new browser session"""
-        try:
-            session_id = request.session_id or f"session_{int(time.time() * 1000)}"
-            
-            if session_id in server_state.browser_sessions:
-                raise HTTPException(status_code=400, detail=f"Session {session_id} already exists")
+        session_id = request.session_id or f"session_{int(time.time() * 1000)}"
+        
+        # Check for existing session BEFORE the try block
+        if session_id in server_state.browser_sessions:
+            raise HTTPException(status_code=400, detail=f"Session {session_id} already exists")
+        
+        # Check if this session was already completed (form submitted)
+        if server_state.form_submission_status.get(session_id, False):
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Session {session_id} was already completed and closed. Form submission is complete. Do not create new sessions."
+            )
 
+        try:
             # Create browser profile with basic settings
             profile = BrowserProfile(
                 downloads_path=str(Path.home() / 'Downloads' / 'browser-use-api'),
                 wait_between_actions=request.wait_between_actions,
-                keep_alive=False,
+                keep_alive=False,  # Keep browser alive between tool calls
                 user_data_dir='~/.config/browseruse/profiles/api',
-                # headless=request.headless,
                 headless=False,
                 allowed_domains=request.allowed_domains,
             )
@@ -357,6 +369,9 @@ def create_app() -> FastAPI:
             # Initialize FileSystem
             file_system_path = Path.home() / '.browser-use-api'
             server_state.file_systems[session_id] = FileSystem(base_dir=file_system_path)
+            
+            # Initialize form submission status as False (not yet submitted)
+            server_state.form_submission_status[session_id] = False
 
             logger.info(f"Created browser session {session_id}")
             
@@ -366,7 +381,22 @@ def create_app() -> FastAPI:
                 message=f"Browser session {session_id} created successfully"
             )
 
+        except HTTPException:
+            # Re-raise HTTP exceptions as-is (don't wrap them)
+            raise
         except Exception as e:
+            # Clean up partial session if creation failed
+            if session_id in server_state.browser_sessions:
+                try:
+                    await server_state.browser_sessions[session_id].stop()
+                except Exception:
+                    pass
+                del server_state.browser_sessions[session_id]
+            if session_id in server_state.controllers:
+                del server_state.controllers[session_id]
+            if session_id in server_state.file_systems:
+                del server_state.file_systems[session_id]
+                
             logger.error(f"Error creating session: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
@@ -393,10 +423,18 @@ def create_app() -> FastAPI:
                 del server_state.controllers[session_id]
             if session_id in server_state.file_systems:
                 del server_state.file_systems[session_id]
+            
+            # Mark form submission as complete for this session
+            server_state.form_submission_status[session_id] = True
 
             logger.info(f"Closed browser session {session_id}")
             
-            return {"message": f"Session {session_id} closed successfully"}
+            return {
+                "status": "success",
+                "message": f"Session {session_id} closed successfully",
+                "task_complete": True,
+                "next_action": "TASK_COMPLETE - Call check_form_submission_status to confirm, then stop"
+            }
 
         except Exception as e:
             logger.error(f"Error closing session {session_id}: {e}")
@@ -431,9 +469,52 @@ def create_app() -> FastAPI:
         try:
             tool_name = request.tool_name
             parameters = request.parameters
+
+            # If parameters is a JSON string, parse it
+            if isinstance(parameters, str):
+                parameters = json.loads(parameters)
+
+            # ✅ UNWRAP: Subconscious wrapper tool sends tool_name="browser_mcp"
+            # with inner {tool_name: "...", parameters: "... or {...}"}
+            if tool_name == "browser_mcp":
+                inner_tool_name = parameters.get("tool_name")
+                inner_params = parameters.get("parameters", {})
+
+                if inner_tool_name is None:
+                    raise HTTPException(status_code=400, detail="Missing inner tool_name inside parameters")
+
+                # inner_params might also be JSON string
+                if isinstance(inner_params, str):
+                    inner_params = json.loads(inner_params)
+
+                tool_name = inner_tool_name
+                parameters = inner_params
+
+            logger.info(f"✅ Normalized MCP call -> tool_name={tool_name}, parameters={json.dumps(parameters, indent=2)}")
+                
+            # DEBUG: Log incoming request
+            logger.info(f"🔍 MCP Request received:")
+            logger.info(f"   tool_name: {tool_name}")
+            logger.info(f"   parameters: {json.dumps(parameters, indent=2)}")
+            
+            # Check if session is already completed (form submitted)
+            # Allow get_tool_schemas and check_form_submission_status to always run
+            if tool_name not in ["get_tool_schemas", "check_form_submission_status"]:
+                session_id = parameters.get("session_id")
+                if session_id and server_state.form_submission_status.get(session_id, False):
+                    return {
+                        "status": "completed",
+                        "form_submitted": True,
+                        "message": "Form has already been successfully submitted. Task is complete. No further actions needed.",
+                        "session_id": session_id,
+                        "instruction": "Stop execution now. Do not create new sessions or perform any more browser actions."
+                    }
+
+            if tool_name == "get_tool_schemas":
+                return tool_schemas()
             
             # Session management tools
-            if tool_name == "create_browser_session":
+            elif tool_name == "create_browser_session":
                 create_req = CreateSessionRequest(**parameters)
                 return await create_session(create_req)
             
@@ -443,6 +524,28 @@ def create_app() -> FastAPI:
             elif tool_name == "close_browser_session":
                 close_req = CloseSessionRequest(**parameters)
                 return await close_session(close_req)
+            
+            elif tool_name == "check_form_submission_status":
+                check_req = CheckSubmissionStatusRequest(**parameters)
+                session_id = check_req.session_id
+                
+                # Check if form submission was completed (browser closed)
+                is_complete = server_state.form_submission_status.get(session_id, False)
+                
+                if is_complete:
+                    return {
+                        "status": "complete",
+                        "form_submitted": True,
+                        "message": "Form has been successfully submitted. Task is complete. Stop execution now.",
+                        "session_id": session_id
+                    }
+                else:
+                    return {
+                        "status": "pending",
+                        "form_submitted": False,
+                        "message": "Form submission not yet complete. Browser session is still active or was not properly closed.",
+                        "session_id": session_id
+                    }
             
             # Browser navigation tools
             elif tool_name == "navigate":
@@ -470,9 +573,9 @@ def create_app() -> FastAPI:
                 return await get_browser_state(state_req)
             
             # Content extraction tool
-            elif tool_name == "extract_content":
-                extract_req = BrowserExtractContentRequest(**parameters)
-                return await browser_extract_content(extract_req)
+            # elif tool_name == "extract_content":
+            #     extract_req = BrowserExtractContentRequest(**parameters)
+            #     return await browser_extract_content(extract_req)
             
             # Browser navigation tools
             elif tool_name == "go_back":
@@ -535,43 +638,37 @@ def create_app() -> FastAPI:
 
     @app.get("/mcp")
     async def mcp_get_endpoint():
-        """GET endpoint for MCP - returns available tools"""
         return {
             "message": "MCP Unified Endpoint",
             "method": "POST",
             "endpoint": "/mcp",
-            "description": "Send tool requests with tool_name and parameters",
             "available_tools": [
-                # Session management
+                "get_tool_schemas",
                 "create_browser_session",
-                "list_browser_sessions", 
+                "list_browser_sessions",
                 "close_browser_session",
-                # Browser control
-                "browser_navigate",
-                "browser_click",
-                "browser_type",
-                "browser_key",
-                "browser_scroll",
+                "navigate",
+                "go_back",
                 "browser_get_state",
-                # Content extraction
-                "browser_extract_content",
-                # Navigation
-                "browser_go_back",
-                # Tab management
-                "browser_list_tabs",
-                "browser_switch_tab",
-                "browser_close_tab",
-                # Agent tasks
-                "run_agent_task",
-                "retry_with_browser_use_agent",
+                "click",
+                "type",
+                "key",
+                "scroll",
+                "select_dropdown_option",
+                "upload_file",
+                "list_tabs",
+                "switch_tab",
+                "close_tab",
+                # "extract_content",
+                "browse_agent",
+                "retry_browse_agent",
                 "get_agent_task_status",
-                # Account management
                 "generate_account_credentials",
                 "retrieve_account_credentials"
             ],
             "schema": {
                 "tool_name": "string (required)",
-                "parameters": "object (required) - parameters specific to each tool"
+                "parameters": "object (required) - tool-specific"
             }
         }
 
@@ -1051,7 +1148,7 @@ def create_app() -> FastAPI:
 
             # Create LLM for extraction
             llm = ChatOpenAI(
-                model="gpt-4.1",  # Using mini for content extraction to reduce costs
+                model="gpt-4o",  # Using mini for content extraction to reduce costs
                 api_key=api_key,
                 temperature=0.7,
             )
@@ -1419,6 +1516,185 @@ def create_app() -> FastAPI:
 
 # Create app instance
 app = create_app()
+
+def tool_schemas() -> Dict[str, Any]:
+    return {
+        "rules": [
+            "All requests are POST /mcp with {tool_name: string, parameters: object}.",
+            "For DOM elements, the key is ALWAYS 'index' (never element_index).",
+            "Call browser_get_state before click/type to get correct indices.",
+            "Indices can change after interactions; refresh state often.",
+            "Use the same session_id across calls."
+        ],
+        "tools": {
+            "create_browser_session": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id"],
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "headless": {"type": "boolean"},
+                        "allowed_domains": {"type": "array", "items": {"type": "string"}},
+                        "wait_between_actions": {"type": "number"}
+                    },
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "create_browser_session", "parameters": {"session_id": "session_123", "headless": False, "allowed_domains": []}}
+            },
+            "navigate": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id", "url"],
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "url": {"type": "string"},
+                        "new_tab": {"type": "boolean"}
+                    },
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "navigate", "parameters": {"session_id": "session_123", "url": "https://example.com", "new_tab": False}}
+            },
+            "browser_get_state": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id"],
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "include_screenshot": {"type": "boolean"}
+                    },
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "browser_get_state", "parameters": {"session_id": "session_123", "include_screenshot": False}}
+            },
+            "click": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id", "index"],
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "index": {"type": "integer"},
+                        "new_tab": {"type": "boolean"}
+                    },
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "click", "parameters": {"session_id": "session_123", "index": 4, "new_tab": False}}
+            },
+            "type": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id", "index", "text"],
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "index": {"type": "integer"},
+                        "text": {"type": "string"}
+                    },
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "type", "parameters": {"session_id": "session_123", "index": 2, "text": "Robert Martinez"}}
+            },
+            "key": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id", "key"],
+                    "properties": {"session_id": {"type": "string"}, "key": {"type": "string"}},
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "key", "parameters": {"session_id": "session_123", "key": "Enter"}}
+            },
+            "scroll": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id"],
+                    "properties": {"session_id": {"type": "string"}, "direction": {"type": "string"}},
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "scroll", "parameters": {"session_id": "session_123", "direction": "down"}}
+            },
+            "select_dropdown_option": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id", "index", "text"],
+                    "properties": {"session_id": {"type": "string"}, "index": {"type": "integer"}, "text": {"type": "string"}},
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "select_dropdown_option", "parameters": {"session_id": "session_123", "index": 7, "text": "United States"}}
+            },
+            "upload_file": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id", "index", "file_path"],
+                    "properties": {"session_id": {"type": "string"}, "index": {"type": "integer"}, "file_path": {"type": "string"}},
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "upload_file", "parameters": {"session_id": "session_123", "index": 10, "file_path": "C:/tmp/doc.pdf"}}
+            },
+            "list_tabs": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id"],
+                    "properties": {"session_id": {"type": "string"}},
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "list_tabs", "parameters": {"session_id": "session_123"}}
+            },
+            "switch_tab": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id", "tab_index"],
+                    "properties": {"session_id": {"type": "string"}, "tab_index": {"type": "integer"}},
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "switch_tab", "parameters": {"session_id": "session_123", "tab_index": 1}}
+            },
+            "close_tab": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id", "tab_index"],
+                    "properties": {"session_id": {"type": "string"}, "tab_index": {"type": "integer"}},
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "close_tab", "parameters": {"session_id": "session_123", "tab_index": 1}}
+            },
+            "go_back": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id"],
+                    "properties": {"session_id": {"type": "string"}},
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "go_back", "parameters": {"session_id": "session_123"}}
+            },
+            # "extract_content": {
+            #     "parameters": {
+            #         "type": "object",
+            #         "required": ["session_id", "query"],
+            #         "properties": {"session_id": {"type": "string"}, "query": {"type": "string"}, "extract_links": {"type": "boolean"}},
+            #         "additionalProperties": False
+            #     },
+            #     "example": {"tool_name": "extract_content", "parameters": {"session_id": "session_123", "query": "What is the page title?", "extract_links": False}}
+            # },
+            "close_browser_session": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id"],
+                    "properties": {"session_id": {"type": "string"}},
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "close_browser_session", "parameters": {"session_id": "session_123"}}
+            },
+            "check_form_submission_status": {
+                "parameters": {
+                    "type": "object",
+                    "required": ["session_id"],
+                    "properties": {"session_id": {"type": "string"}},
+                    "additionalProperties": False
+                },
+                "example": {"tool_name": "check_form_submission_status", "parameters": {"session_id": "session_123"}},
+                "description": "Check if the form submission was successful by verifying if the browser session was properly closed. Returns True if session was closed successfully (indicating form submission complete)."
+            }
+        }
+    }
+
 
 def main():
     """Main entry point for running the server"""
